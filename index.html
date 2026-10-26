@@ -3,17 +3,52 @@
   <head>
     <meta charset="UTF-8" />
     <base href="/" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#11110f" />
     <meta name="description" content="k web — выразительные сайты под ключ для бизнеса. Индивидуальный дизайн, адаптация и публикация в интернете." />
     <link rel="icon" type="image/svg+xml" href="kirill-web-mark.svg" />
     <title>k web — сайты под ключ</title>
+    <style>
+      html,body{margin:0;min-height:100%;background:#11110f;color:#f5f2ea}
+      .boot-fallback{box-sizing:border-box;min-height:100svh;padding:clamp(24px,7vw,64px);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;flex-direction:column;justify-content:space-between;gap:36px;background:radial-gradient(ellipse at 80% 40%,#333127 0,transparent 45%),#11110f}
+      .boot-top,.boot-bottom{display:flex;align-items:center;justify-content:space-between;gap:16px}
+      .boot-mark{font-size:24px;font-weight:800;letter-spacing:-.08em;color:#f5f2ea;text-decoration:none}
+      .boot-label{font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.14em;color:#a7a498;text-transform:uppercase}
+      .boot-copy{max-width:760px;padding:48px 0}
+      .boot-copy h1{margin:0 0 20px;font-size:clamp(48px,12vw,100px);line-height:.98;letter-spacing:-.075em;font-weight:750}
+      .boot-copy h1 span{color:#d5fa75}
+      .boot-copy p{max-width:560px;margin:0 0 30px;font-size:clamp(16px,4.4vw,20px);line-height:1.65;color:#c9c6ba}
+      .boot-actions{display:flex;flex-wrap:wrap;gap:12px}
+      .boot-button{display:inline-flex;min-height:50px;align-items:center;justify-content:center;padding:0 22px;border-radius:999px;background:#d5fa75;color:#11110f;text-decoration:none;font-weight:700}
+      .boot-secondary{border:1px solid #555449;background:transparent;color:#f5f2ea}
+      .boot-bottom{padding-top:20px;border-top:1px solid #37362f;color:#a7a498;font-size:13px}
+      .boot-bottom a{color:#f5f2ea;text-decoration:none}
+      @media(max-width:520px){.boot-fallback{padding:24px;min-height:100vh}.boot-top{align-items:flex-start}.boot-label{text-align:right}.boot-copy{padding:30px 0}.boot-bottom{align-items:flex-start;flex-direction:column}}
+    </style>
+    <link rel="stylesheet" crossorigin href="assets/site-mobile-safe.css" />
     <script type="module" crossorigin src="assets/index-c723d1ca.js"></script>
-    <link rel="stylesheet" crossorigin href="assets/index-DMz7L2DL.css">
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main class="boot-fallback">
+        <header class="boot-top">
+          <a class="boot-mark" href="#top" aria-label="k web">K/</a>
+          <span class="boot-label">Разработка сайтов<br />для бизнеса · 2026</span>
+        </header>
+        <section class="boot-copy" id="top">
+          <h1>Сайт, который<br /><span>работает</span><br />на бизнес.</h1>
+          <p>Собираю выразительные сайты под ключ для кафе, магазинов, студий, сервисов и других компаний — от первой идеи до публикации.</p>
+          <nav class="boot-actions" aria-label="Связаться">
+            <a class="boot-button" href="https://t.me/Kirill_XX777">Обсудить задачу в Telegram</a>
+            <a class="boot-button boot-secondary" href="mailto:l34448616@gmail.com">Написать на почту</a>
+          </nav>
+        </section>
+        <footer class="boot-bottom">
+          <span>k web · Сайты под ключ для бизнеса</span>
+          <span>Также: <a href="https://max.ru/u/f9LHodD0cOLVCDBtU9-RJYjLUArPaJexUo9Tx-rkLlmVCTAfUThEGVVCuyk">MAX</a></span>
+        </footer>
+      </main>
+    </div>
     <script src="site-config.js"></script>
-  <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/vce701823e78c4301a35b7e07294d87301792088814092" integrity="sha512-UKNk8GbxkABxKcXYuLkO16EleLGUkcvJWtpSNmExE0Too3ZaFAxTscNWEc1OdAv5/BikHawapSCaiD2XCmp+Bw==" data-cf-beacon='{"version":"2024.11.0","token":"592b388ca3ad43078090f196eefba778","r":1,"spa":2}' crossorigin="anonymous"></script>
-</body>
+  </body>
 </html>
