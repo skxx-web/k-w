@@ -39,14 +39,15 @@ const ADMIN_MENU = {
       { text: "CSV клиентов", callback_data: "export:csv" },
       { text: "Резервная копия", callback_data: "backup" },
     ],
+    [{ text: "Мои реквизиты", callback_data: "admin:requisites" }],
   ],
 };
 
 const USER_MENU = {
   inline_keyboard: [
     [{ text: "Оставить заявку", callback_data: "request:start" }],
-    [{ text: "Мой кабинет", callback_data: "cabinet" }],
-    [{ text: "Отправить чек", callback_data: "receipt:start" }],
+    [{ text: "Проверить подписку", callback_data: "cabinet" }],
+    [{ text: "Запросить реквизиты для оплаты", callback_data: "receipt:start" }],
   ],
 };
 
@@ -115,6 +116,26 @@ async function enqueueAdmins(env, key, text, keyboard = null, category = "admin_
       text,
       keyboard,
       category,
+    });
+  }
+}
+
+async function enqueueAdminsCopy(env, { key, fromChatId, messageId, caption, keyboard, category, serviceId = null, periodEnd = null }) {
+  for (const id of adminIds(env)) {
+    await queueOutbox(env.DB, {
+      dedupeKey: `${key}:admin:${id}`,
+      target: "admin",
+      chatId: id,
+      method: "copyMessage",
+      payload: {
+        from_chat_id: String(fromChatId),
+        message_id: Number(messageId),
+        caption: cleanText(caption, 900),
+        reply_markup: keyboard,
+      },
+      category,
+      serviceId,
+      periodEnd,
     });
   }
 }
@@ -194,6 +215,30 @@ async function displayAdminMenu(env, updateId, chatId, text = "K web — обс�
 
 async function displayUserMenu(env, updateId, chatId, text = "Здравствуйте! Чем помочь?") {
   return sendUserText(env, updateId, chatId, text, USER_MENU, "user_menu");
+}
+
+function clientWelcomeText(services) {
+  const today = localDateString();
+  if (!services.length) return "Здравствуйте!\nПодписка не активна. Чтобы узнать условия оплаты, запросите реквизиты.";
+  const lines = services.map((service) => {
+    const active = service.valid_through >= today;
+    const status = active ? `Подписка активна до ${service.valid_through}.` : `Подписка не активна — срок закончился ${service.valid_through}.`;
+    const receipt = Number(service.pending_receipts || 0) > 0 ? " Чек получен и ожидает проверки." : "";
+    return `${status}${receipt}`;
+  });
+  return `Здравствуйте!\n\n${lines.join("\n")}`;
+}
+
+async function showPaymentRequisites(env, updateId, chatId) {
+  const requisites = await getSetting(env.DB, "payment_requisites");
+  const text = requisites
+    ? `Мои реквизиты для оплаты:\n\n${requisites}`
+    : "Реквизиты пока не заданы. Отправьте их следующим сообщением, чтобы добавить или изменить.";
+  return sendUserText(env, updateId, chatId, text, inline([
+    [button(requisites ? "Изменить реквизиты" : "Добавить реквизиты", "admin:requisites:edit")],
+    ...(requisites ? [[button("Очистить реквизиты", "admin:requisites:clear")]] : []),
+    [button("В меню", "menu:admin")],
+  ]), "admin_requisites");
 }
 
 async function processOutbox(env, limit = 20) {
@@ -331,9 +376,8 @@ async function handleStart(env, updateId, message) {
     await displayAdminMenu(env, updateId, chatId);
   } else {
     const linked = await first(env.DB, "SELECT id FROM clients WHERE telegram_user_id=? AND status='active' LIMIT 1", userId);
-    await displayUserMenu(env, updateId, chatId, linked
-      ? "Вы вошли в кабинет K web. Здесь отображаются сроки и состояние оплаты; для оплаты приложите фото или PDF чека."
-      : "K web — обслуживание сайтов. Чтобы получить доступ к кабинету, оставьте заявку. Telegram-ник подставится автоматически, также понадобится e-mail.");
+    if (linked) return showClientCabinet(env, updateId, chatId, userId);
+    await displayUserMenu(env, updateId, chatId, "Здравствуйте! Чтобы подключить обслуживание, оставьте заявку.");
   }
 }
 
@@ -354,9 +398,10 @@ async function startReceiptFlow(env, updateId, chatId, userId) {
   if (!client) return sendUserText(env, updateId, chatId, "Кабинет ещё не подключён. Сначала отправьте заявку; администратор проверит данные и откроет доступ.", USER_MENU, "receipt_not_authorized");
   const services = await all(env.DB, "SELECT id, site_name, valid_through FROM services WHERE client_id=? AND status='active' ORDER BY id DESC", client.id);
   if (!services.length) return sendUserText(env, updateId, chatId, "У вас пока нет активных сайтов для оплаты.", inline([[button("Мой кабинет", "cabinet"), button("В меню", "menu:user")]]), "receipt_no_services");
-  const rows = services.map((service) => [button(`${service.site_name} · оплачено по ${service.valid_through}`, `receipt:service:${service.id}`)]);
+  if (services.length === 1) return startReceiptForService(env, updateId, chatId, userId, services[0].id);
+  const rows = services.map((service) => [button(`${service.site_name} · до ${service.valid_through}`, `receipt:service:${service.id}`)]);
   rows.push([button("Назад", "cabinet")]);
-  return sendUserText(env, updateId, chatId, "Выберите сайт, за который отправляете чек. Затем прикрепите только фотографию или PDF — текст вводить не нужно.", inline(rows), "receipt_service_picker");
+  return sendUserText(env, updateId, chatId, "Выберите подписку, за которую хотите оплатить. После выбора появятся реквизиты и кнопка для отправки подтверждения оплаты.", inline(rows), "receipt_service_picker");
 }
 
 async function startReceiptForService(env, updateId, chatId, userId, serviceId) {
@@ -369,8 +414,21 @@ async function startReceiptForService(env, updateId, chatId, userId, serviceId) 
     String(userId),
   );
   if (!service) return sendUserText(env, updateId, chatId, "Этот сайт не привязан к вашему кабинету.", inline([[button("Мой кабинет", "cabinet")]]), "receipt_service_denied");
-  await saveSession(env.DB, userId, { flow: "receipt", step: "proof", data: { service_id: service.id } });
-  return sendUserText(env, updateId, chatId, `Оплата: ${service.site_name}. Прикрепите фотографию или PDF чека. Можно отправить только файл, без текста.`, null, "receipt_prompt");
+  const requisites = await getSetting(env.DB, "payment_requisites");
+  if (!requisites) return sendUserText(env, updateId, chatId, "Реквизиты пока не настроены. Пожалуйста, обратитесь к администратору.", inline([[button("Назад", "cabinet")]]), "payment_requisites_missing");
+  await saveSession(env.DB, userId, { flow: "receipt", step: "await_upload", data: { service_id: service.id } });
+  return sendUserText(env, updateId, chatId, `Реквизиты для оплаты:\n\n${requisites}\n\nПосле оплаты нажмите кнопку ниже и приложите подтверждение.`, inline([
+    [button("Предоставить изображение или файл", "receipt:upload")],
+  ]), "payment_requisites");
+}
+
+async function startReceiptUpload(env, updateId, chatId, userId) {
+  const session = await getSession(env.DB, userId);
+  if (session?.flow !== "receipt" || session.step !== "await_upload" || !session.data?.service_id) {
+    return sendUserText(env, updateId, chatId, "Сначала запросите реквизиты и выберите подписку.", inline([[button("Запросить реквизиты", "receipt:start")]]), "receipt_upload_stale");
+  }
+  await saveSession(env.DB, userId, { ...session, step: "proof" });
+  return sendUserText(env, updateId, chatId, "Теперь прикрепите изображение или PDF-файл подтверждения оплаты. Другие сообщения не принимаются.", null, "receipt_upload_prompt");
 }
 
 async function showClientCabinet(env, updateId, chatId, userId) {
@@ -378,23 +436,15 @@ async function showClientCabinet(env, updateId, chatId, userId) {
   if (!client) return sendUserText(env, updateId, chatId, "Доступ к кабинету пока не открыт. Оставьте заявку — после проверки администратор подключит профиль.", USER_MENU, "cabinet_not_authorized");
   const services = await all(
     env.DB,
-    `SELECT s.*,
-       (SELECT pe.created_at FROM payment_events pe WHERE pe.service_id=s.id AND pe.action IN ('approved','manual_approved') ORDER BY pe.id DESC LIMIT 1) AS last_payment_at,
-       (SELECT pe.amount_minor FROM payment_events pe WHERE pe.service_id=s.id AND pe.action IN ('approved','manual_approved') ORDER BY pe.id DESC LIMIT 1) AS last_payment_amount,
+    `SELECT s.valid_through,
        (SELECT COUNT(*) FROM receipts r WHERE r.service_id=s.id AND r.status='pending') AS pending_receipts
      FROM services s WHERE s.client_id=? AND s.status='active' ORDER BY s.id DESC LIMIT 12`,
     client.id,
   );
-  const lines = services.map((service) => {
-    const baseStatus = service.payment_status === "paid" ? "Текущий период оплачен" : service.payment_status === "pending" ? "Чек проверяется" : "Ожидает оплаты";
-    const status = Number(service.pending_receipts) > 0 ? `${baseStatus}; новый чек на проверке` : baseStatus;
-    const lastPayment = service.last_payment_at
-      ? `Последняя подтверждённая оплата: ${String(service.last_payment_at).slice(0, 10)}${service.last_payment_amount == null ? "" : ` · ${formatMoney(service.last_payment_amount, service.currency)}`}`
-      : "Подтверждённых оплат пока нет";
-    return `• ${service.site_name}\n  Статус: ${status}\n  Оплачено по: ${service.valid_through}\n  Стоимость: ${formatMoney(service.monthly_price_minor, service.currency)} / месяц\n  ${lastPayment}`;
-  });
-  const text = `Кабинет K web\nКлиент: ${client.full_name}\nTelegram: ${client.telegram_username || "ник не задан"}\nE-mail: ${client.email || "не указан"}\n\n${lines.length ? lines.join("\n\n") : "Активных сайтов пока нет."}`;
-  return sendUserText(env, updateId, chatId, text, inline([[button("Отправить чек (фото/PDF)", "receipt:start")], [button("Обновить", "cabinet")]]), "client_cabinet");
+  return sendUserText(env, updateId, chatId, clientWelcomeText(services), inline([
+    [button("Запросить реквизиты для оплаты", "receipt:start")],
+    [button("Обновить", "cabinet")],
+  ]), "client_cabinet");
 }
 
 async function askPhone(env, updateId, chatId) {
@@ -480,10 +530,12 @@ async function identifyService(env, userId, siteText) {
   return linked.length === 1 ? linked[0] : null;
 }
 
-function receiptCaption({ receiptId, clientName, siteName, siteUrl, periodEnd, amountMinor, note, lastPayment }) {
+function receiptCaption({ receiptId, clientName, telegramUsername, email, siteName, siteUrl, periodEnd, amountMinor, note, lastPayment }) {
   return [
     `ЧЕК #${receiptId} — ОЖИДАЕТ ПРОВЕРКИ`,
     `Клиент: ${clientName || "не определён"}`,
+    telegramUsername ? `Telegram: ${telegramUsername}` : null,
+    email ? `E-mail: ${email}` : null,
     `Сайт: ${siteName || siteUrl || "не указан"}`,
     `Дата: ${localDateString()}`,
     periodEnd ? `Оплаченный период до: ${periodEnd}` : null,
@@ -553,6 +605,8 @@ async function createReceipt(env, updateId, message, state, media) {
   const caption = receiptCaption({
     receiptId,
     clientName: service.full_name,
+    telegramUsername: service.telegram_username,
+    email: service.email,
     siteName: service.site_name,
     siteUrl: service.site_url,
     periodEnd: service.valid_through,
@@ -569,11 +623,19 @@ async function createReceipt(env, updateId, message, state, media) {
     periodEnd: service.valid_through,
     receiptId,
   });
-  const adminText = `${caption}\nТелефон: ${service.phone || "не указан"}\nTelegram: ${service.telegram_username || "ник не задан"}\nE-mail: ${service.email || "не указан"}`;
   const buttons = service
     ? inline([[button("Подтвердить оплату", `receipt:approve:${receiptId}`), button("Отклонить", `receipt:reject:${receiptId}`)], [button("Открыть", `receipt:view:${receiptId}`)]])
     : inline([[button("Привязать к сайту", `receipt:link:${receiptId}`), button("Отклонить", `receipt:reject:${receiptId}`)], [button("Открыть", `receipt:view:${receiptId}`)]]);
-  await enqueueAdmins(env, `receipt:${receiptId}`, adminText, buttons, "receipt_notice");
+  await enqueueAdminsCopy(env, {
+    key: `receipt:${receiptId}:admin-copy`,
+    fromChatId: message.chat.id,
+    messageId: message.message_id,
+    caption,
+    keyboard: buttons,
+    category: "receipt_admin_copy",
+    serviceId: service.id,
+    periodEnd: service.valid_through,
+  });
   await recordEvent(env, {
     actorId: userId,
     action: "receipt_submitted",
@@ -698,8 +760,11 @@ async function handleAdminCreationStep(env, updateId, message, session) {
             target: "user",
             chatId: data.telegram_user_id,
             key: `client:${clientId}:activated:${data.telegram_user_id}`,
-            text: `Вам открыт кабинет K web. Клиент: ${data.full_name}. Сайт: ${data.site_name}. Оплачено по: ${data.valid_through}. Откройте «Мой кабинет», чтобы посмотреть оплату и отправить фото/PDF чека.`,
-            keyboard: USER_MENU,
+            text: `Здравствуйте! Добро пожаловать в кабинет K web.\n\n${clientWelcomeText([{ valid_through: data.valid_through, pending_receipts: 0 }])}`,
+            keyboard: inline([
+              [button("Запросить реквизиты для оплаты", "receipt:start")],
+              [button("Проверить подписку", "cabinet")],
+            ]),
             category: "client_activated",
           });
           if (session.requestId) {
@@ -870,6 +935,26 @@ async function handleUserSession(env, updateId, message, session) {
   const userId = String(message.from.id);
   const chatId = userChatId(message);
   if (message.chat?.type !== "private") return;
+  if (session.flow === "payment_requisites") {
+    if (!isAdmin(userId, env)) {
+      await clearSession(env.DB, userId);
+      return sendUserText(env, updateId, chatId, "Нет доступа.", null, "access_denied");
+    }
+    const text = cleanText(message.text ?? "", 1800);
+    if (!text) return sendUserText(env, updateId, chatId, "Отправьте текст реквизитов или /cancel для отмены.", null, "requisites_prompt");
+    await setSetting(env.DB, "payment_requisites", text);
+    await clearSession(env.DB, userId);
+    await recordEvent(env, {
+      actorId: userId,
+      action: "payment_requisites_updated",
+      entityType: "settings",
+      entityId: "payment_requisites",
+      details: { valueHidden: true },
+      archiveText: "Администратор обновил реквизиты для оплаты. Сами реквизиты не записаны в архив.",
+      archiveKey: `archive:payment-requisites-updated:${nowIso()}`,
+    });
+    return showPaymentRequisites(env, updateId, chatId);
+  }
   if (session.flow === "new_client" || session.flow === "new_service") return handleAdminCreationStep(env, updateId, message, session);
   if (session.flow === "edit_client" || session.flow === "edit_service") return handleEditStep(env, updateId, message, session);
 
@@ -1253,7 +1338,7 @@ async function approveReceipt(env, updateId, chatId, adminId, receiptId) {
   ]);
   if (!results[0]?.meta?.changes || !results[1]?.meta?.changes) return showReceipt(env, updateId, chatId, receipt.id, "Период уже был изменён другим действием. Обновите карточку и проверьте оплату.");
   const client = await first(env.DB, "SELECT * FROM clients WHERE id=?", service.client_id);
-  const text = `Оплата чека #${receipt.id} подтверждена. Сайт: ${service.site_name}. Сумма: ${formatMoney(amount, service.currency)}. Новый оплаченный период до ${nextDate}. Откройте «Мой кабинет», чтобы посмотреть актуальный статус.`;
+  const text = `Здравствуйте! Оплата подтверждена.\n\n${clientWelcomeText([{ valid_through: nextDate, pending_receipts: 0 }])}`;
   await recordEvent(env, {
     actorId: adminId,
     action: "payment_approved",
@@ -1269,7 +1354,7 @@ async function approveReceipt(env, updateId, chatId, adminId, receiptId) {
       chatId: client.telegram_user_id,
       key: `receipt:${receipt.id}:approved:user`,
       text,
-      keyboard: USER_MENU,
+      keyboard: inline([[button("Проверить подписку", "cabinet")], [button("Запросить реквизиты", "receipt:start")]]),
       category: "payment_result",
       serviceId: service.id,
       periodEnd: nextDate,
@@ -1309,7 +1394,7 @@ async function rejectReceipt(env, updateId, chatId, adminId, receiptId) {
     if (!Number(pending?.count)) await run(env.DB, "UPDATE services SET payment_status='unpaid', updated_at=? WHERE id=? AND payment_status='pending'", now, receipt.service_id);
   }
   const client = receipt.client_id ? await first(env.DB, "SELECT * FROM clients WHERE id=?", receipt.client_id) : null;
-  const text = `Чек #${receipt.id} отклонён после проверки. Оплата не подтверждена. Клиент: ${client?.full_name || "не определён"}.`;
+  const text = "Здравствуйте! Чек проверен, но оплата не подтверждена. Проверьте реквизиты и отправьте подтверждение ещё раз либо свяжитесь с администратором.";
   await recordEvent(env, {
     actorId: adminId,
     action: "payment_rejected",
@@ -1324,7 +1409,7 @@ async function rejectReceipt(env, updateId, chatId, adminId, receiptId) {
     chatId: receipt.telegram_user_id,
     key: `receipt:${receipt.id}:rejected:user`,
     text: "Чек проверен, но оплата не подтверждена. Свяжитесь с администратором, если считаете это ошибкой.",
-    keyboard: USER_MENU,
+    keyboard: inline([[button("Запросить реквизиты", "receipt:start")], [button("Проверить подписку", "cabinet")]]),
     category: "payment_result",
   });
   await sendUserText(env, updateId, chatId, "Чек отклонён; подписка не продлена.", inline(backToAdmin()), "receipt_result");
@@ -1360,7 +1445,7 @@ async function manualPayment(env, updateId, chatId, adminId, serviceId) {
       .bind(service.id, service.valid_through, service.id, nextDate),
   ]);
   if (!results[0]?.meta?.changes) return showService(env, updateId, chatId, service.id, "Сайт изменился во время подтверждения. Обновите карточку и повторите проверку.");
-  const text = `Оплата подтверждена администратором. Сайт: ${service.site_name}. Сумма: ${formatMoney(service.monthly_price_minor, service.currency)}. Новый оплаченный период до ${nextDate}. Откройте «Мой кабинет», чтобы посмотреть актуальный статус.`;
+  const text = `Здравствуйте! Оплата подтверждена.\n\n${clientWelcomeText([{ valid_through: nextDate, pending_receipts: 0 }])}`;
   await recordEvent(env, {
     actorId: adminId,
     action: "manual_payment_approved",
@@ -1376,7 +1461,7 @@ async function manualPayment(env, updateId, chatId, adminId, serviceId) {
       chatId: service.telegram_user_id,
       key: `service:${service.id}:manual-payment:${nextDate}:user`,
       text,
-      keyboard: USER_MENU,
+      keyboard: inline([[button("Проверить подписку", "cabinet")], [button("Запросить реквизиты", "receipt:start")]]),
       category: "payment_result",
       serviceId: service.id,
       periodEnd: nextDate,
@@ -1540,8 +1625,8 @@ async function handleCallback(env, updateId, callback) {
     // A stale callback query should not block the authorized action.
   }
   if (!chatId || callback.message?.chat?.type !== "private") return;
-  const customerAction = data === "request:start" || data === "receipt:start" || data === "cabinet" || /^receipt:service:\d+$/.test(data);
-  const adminOnly = !customerAction && /^(clients:|services:|payments:|requests:|history|backup|export:|client:|service:|receipt:|request:)/.test(data);
+  const customerAction = data === "request:start" || data === "receipt:start" || data === "receipt:upload" || data === "cabinet" || /^receipt:service:\d+$/.test(data);
+  const adminOnly = !customerAction && /^(admin:|clients:|services:|payments:|requests:|history|backup|export:|client:|service:|receipt:|request:)/.test(data);
   if (adminOnly && !isAdmin(userId, env)) {
     return sendUserText(env, updateId, chatId, "У этой кнопки нет доступа. Откройте клиентское меню.", USER_MENU, "access_denied");
   }
@@ -1550,8 +1635,30 @@ async function handleCallback(env, updateId, callback) {
   if (data === "menu:user") return displayUserMenu(env, updateId, chatId);
   if (data === "request:start") return startClientRequest(env, updateId, chatId, userId);
   if (data === "receipt:start") return startReceiptFlow(env, updateId, chatId, userId);
+  if (data === "receipt:upload") return startReceiptUpload(env, updateId, chatId, userId);
   if (data === "cabinet") return showClientCabinet(env, updateId, chatId, userId);
   if (/^receipt:service:\d+$/.test(data)) return startReceiptForService(env, updateId, chatId, userId, Number(data.split(":")[2]));
+  if (data === "admin:requisites") return showPaymentRequisites(env, updateId, chatId);
+  if (data === "admin:requisites:edit") {
+    await saveSession(env.DB, userId, { flow: "payment_requisites", step: "value", data: {} });
+    return sendUserText(env, updateId, chatId, "Отправьте реквизиты одним сообщением (до 1800 символов). Можно указать получателя, банк, номер счёта/карты и назначение платежа. Не добавляйте сюда пароли или коды доступа.", null, "requisites_prompt");
+  }
+  if (data === "admin:requisites:clear") return sendUserText(env, updateId, chatId, "Очистить сохранённые реквизиты? Клиенты не смогут запросить их, пока вы не добавите новые.", inline([
+    [button("Да, очистить", "admin:requisites:clearyes"), button("Отмена", "admin:requisites")],
+  ]), "requisites_clear_confirm");
+  if (data === "admin:requisites:clearyes") {
+    await setSetting(env.DB, "payment_requisites", "");
+    await recordEvent(env, {
+      actorId: userId,
+      action: "payment_requisites_cleared",
+      entityType: "settings",
+      entityId: "payment_requisites",
+      details: { valueHidden: true },
+      archiveText: "Администратор очистил платёжные реквизиты.",
+      archiveKey: `archive:payment-requisites-cleared:${nowIso()}`,
+    });
+    return showPaymentRequisites(env, updateId, chatId);
+  }
   if (/^clients:\d+$/.test(data)) return showClients(env, updateId, chatId, Number(data.split(":")[1]));
   if (/^services:\d+$/.test(data)) return showServices(env, updateId, chatId, Number(data.split(":")[1]));
   if (/^requests:\d+$/.test(data)) return showRequests(env, updateId, chatId, Number(data.split(":")[1]));
@@ -1821,12 +1928,12 @@ async function queueDailyReminders(env, date = localDateString(new Date(), env.A
       );
       if (!inserted.meta?.changes) continue;
       const days = daysBetween(service.valid_through, date);
-      const wording = milestone === "before_3_days"
-        ? `истекает через 3 дня (${service.valid_through})`
+      const statusText = milestone === "before_3_days"
+        ? `Подписка действует до ${service.valid_through} и скоро закончится.`
         : milestone === "end_day"
-          ? `заканчивается сегодня (${service.valid_through})`
-          : `истёк вчера (${service.valid_through}); подтверждённой оплаты пока нет`;
-      const text = `Здравствуйте, ${service.full_name}. Срок обслуживания сайта ${service.site_name} (${service.site_url}) ${wording}. Стоимость продления — по согласованному тарифу. Если вы уже оплатили, дождитесь подтверждения администратора.`;
+          ? `Подписка действует до конца сегодняшнего дня (${service.valid_through}).`
+          : `Подписка не активна: срок закончился ${service.valid_through}.`;
+      const text = `Здравствуйте!\n${statusText}\nЕсли вы уже отправили оплату, дождитесь подтверждения администратора.`;
       const key = `reminder:${service.id}:${service.valid_through}:${milestone}`;
       if (service.telegram_user_id) {
         const outboxId = await enqueueText(env, {
@@ -1834,6 +1941,10 @@ async function queueDailyReminders(env, date = localDateString(new Date(), env.A
           chatId: service.telegram_user_id,
           key,
           text,
+          keyboard: inline([
+            [button("Запросить реквизиты для оплаты", "receipt:start")],
+            [button("Проверить подписку", "cabinet")],
+          ]),
           category: "reminder",
           serviceId: service.id,
           periodEnd: service.valid_through,
