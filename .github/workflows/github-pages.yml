@@ -1,0 +1,53 @@
+name: Deploy alternate GitHub Pages host
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Prepare static site for the project URL
+        run: |
+          mkdir -p _site/assets
+          python3 - <<'PY'
+          from pathlib import Path
+          html = Path('index.html').read_text()
+          old = '<base href="/" />'
+          new = '<base href="/k-w/" />'
+          if old not in html:
+              raise SystemExit('Expected root base tag was not found')
+          Path('_site/index.html').write_text(html.replace(old, new, 1))
+          for name in ['assets/site-mobile-safe.css', 'assets/index-c723d1ca.js']:
+              src = Path(name)
+              if not src.is_file():
+                  raise SystemExit(f'Missing site asset: {name}')
+              (Path('_site') / name).write_bytes(src.read_bytes())
+          for name in ['site-config.js', 'kirill-web-mark.svg']:
+              src = Path(name)
+              if not src.is_file():
+                  raise SystemExit(f'Missing site asset: {name}')
+              (Path('_site') / name).write_bytes(src.read_bytes())
+          PY
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
