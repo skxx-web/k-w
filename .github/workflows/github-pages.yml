@@ -3,6 +3,14 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'index.html'
+      - '404.html'
+      - 'assets/**'
+      - 'api/**'
+      - 'site-config.js'
+      - 'kirill-web-mark.svg'
+      - 'manus-routes.json'
   workflow_dispatch:
 permissions:
   contents: read
@@ -19,14 +27,14 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
         with:
           enablement: true
       - name: Prepare static site for the project URL
         run: |
-          mkdir -p _site/assets
+          mkdir -p _site/assets _site/api/platform
           python3 - <<'PY'
           from pathlib import Path
           html = Path('index.html').read_text()
@@ -45,6 +53,13 @@ jobs:
               if not src.is_file():
                   raise SystemExit(f'Missing site asset: {name}')
               (Path('_site') / name).write_bytes(src.read_bytes())
+          for name in ['api/platform/config.js']:
+              src = Path(name)
+              if not src.is_file():
+                  raise SystemExit(f'Missing site asset: {name}')
+              target = Path('_site') / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(src.read_bytes())
           PY
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

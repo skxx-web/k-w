@@ -1,0 +1,19 @@
+name = "kweb-service-bot"
+main = "src/index.js"
+compatibility_date = "2026-10-26"
+workers_dev = true
+send_metrics = false
+
+[vars]
+APP_TIME_ZONE = "Europe/Moscow"
+DEFAULT_CURRENCY = "RUB"
+REMINDER_LOCAL_HOUR = "9"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kweb-service-bot-prod"
+database_id = "a348131b-101b-4cd1-af1e-cc7e3a0755d6"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["0 6 * * *", "*/10 * * * *"]

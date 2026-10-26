@@ -1,0 +1,17 @@
+{
+  "name": "kweb-service-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram bot for K web client service management on Cloudflare Workers and D1",
+  "scripts": {
+    "test": "node --test",
+    "deploy": "wrangler deploy",
+    "migrate:local": "wrangler d1 migrations apply kweb-service-bot-prod --local",
+    "migrate:remote": "wrangler d1 migrations apply kweb-service-bot-prod --remote",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "4.153.0"
+  }
+}
