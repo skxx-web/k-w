@@ -89,6 +89,17 @@ export function isSafeHttpUrl(value) {
   }
 }
 
+export function normalizeTelegramUsername(value) {
+  const text = cleanText(value, 40).replace(/^@/, "");
+  if (!text || text === "-") return null;
+  return /^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(text) ? `@${text}` : undefined;
+}
+
+export function isValidEmail(value) {
+  const text = cleanText(value, 254);
+  return text.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
+}
+
 export function csvCell(value) {
   let text = String(value ?? "").replace(/[\r\n]+/g, " ");
   if (/^[\s\u0000-\u001f]*[=+\-@]/.test(text)) text = `'${text}`;

@@ -4,8 +4,10 @@ import {
   csvSafeFilenamePart,
   daysBetween,
   formatMoney,
+  isValidEmail,
   isIsoDate,
   isSafeHttpUrl,
+  normalizeTelegramUsername,
   localDateString,
   parseMoneyMinor,
   reminderMilestones,
@@ -43,6 +45,7 @@ const ADMIN_MENU = {
 const USER_MENU = {
   inline_keyboard: [
     [{ text: "Оставить заявку", callback_data: "request:start" }],
+    [{ text: "Мой кабинет", callback_data: "cabinet" }],
     [{ text: "Отправить чек", callback_data: "receipt:start" }],
   ],
 };
@@ -327,7 +330,10 @@ async function handleStart(env, updateId, message) {
   if (isAdmin(userId, env)) {
     await displayAdminMenu(env, updateId, chatId);
   } else {
-    await displayUserMenu(env, updateId, chatId, "K web — обслуживание сайтов.\nОтправляя заявку или чек, вы передаёте данные администратору и в закрытый архив K web.");
+    const linked = await first(env.DB, "SELECT id FROM clients WHERE telegram_user_id=? AND status='active' LIMIT 1", userId);
+    await displayUserMenu(env, updateId, chatId, linked
+      ? "Вы вошли в кабинет K web. Здесь отображаются сроки и состояние оплаты; для оплаты приложите фото или PDF чека."
+      : "K web — обслуживание сайтов. Чтобы получить доступ к кабинету, оставьте заявку. Telegram-ник подставится автоматически, также понадобится e-mail.");
   }
 }
 
@@ -337,22 +343,58 @@ async function startClientRequest(env, updateId, chatId, userId) {
     env,
     updateId,
     chatId,
-    "Чтобы передать заявку, напишите ваше имя. Данные увидят администратор и закрытая архивная группа K web.",
+    "Регистрация заявки. Напишите ваше имя. Telegram-ник подставится автоматически, также понадобится e-mail. Данные увидят администратор и закрытая архивная группа K web.",
     null,
     "request_prompt",
   );
 }
 
 async function startReceiptFlow(env, updateId, chatId, userId) {
-  await saveSession(env.DB, userId, { flow: "receipt", step: "site", data: {} });
-  await sendUserText(
-    env,
-    updateId,
-    chatId,
-    "Укажите адрес или название сайта, за обслуживание которого платили. Чек будет скопирован в закрытый архив и останется на проверке до решения администратора.",
-    null,
-    "receipt_prompt",
+  const client = await first(env.DB, "SELECT id FROM clients WHERE telegram_user_id=? AND status='active'", String(userId));
+  if (!client) return sendUserText(env, updateId, chatId, "Кабинет ещё не подключён. Сначала отправьте заявку; администратор проверит данные и откроет доступ.", USER_MENU, "receipt_not_authorized");
+  const services = await all(env.DB, "SELECT id, site_name, valid_through FROM services WHERE client_id=? AND status='active' ORDER BY id DESC", client.id);
+  if (!services.length) return sendUserText(env, updateId, chatId, "У вас пока нет активных сайтов для оплаты.", inline([[button("Мой кабинет", "cabinet"), button("В меню", "menu:user")]]), "receipt_no_services");
+  const rows = services.map((service) => [button(`${service.site_name} · оплачено по ${service.valid_through}`, `receipt:service:${service.id}`)]);
+  rows.push([button("Назад", "cabinet")]);
+  return sendUserText(env, updateId, chatId, "Выберите сайт, за который отправляете чек. Затем прикрепите только фотографию или PDF — текст вводить не нужно.", inline(rows), "receipt_service_picker");
+}
+
+async function startReceiptForService(env, updateId, chatId, userId, serviceId) {
+  const service = await first(
+    env.DB,
+    `SELECT s.id, s.site_name, s.valid_through FROM services s
+     JOIN clients c ON c.id=s.client_id
+     WHERE s.id=? AND s.status='active' AND c.status='active' AND c.telegram_user_id=?`,
+    Number(serviceId),
+    String(userId),
   );
+  if (!service) return sendUserText(env, updateId, chatId, "Этот сайт не привязан к вашему кабинету.", inline([[button("Мой кабинет", "cabinet")]]), "receipt_service_denied");
+  await saveSession(env.DB, userId, { flow: "receipt", step: "proof", data: { service_id: service.id } });
+  return sendUserText(env, updateId, chatId, `Оплата: ${service.site_name}. Прикрепите фотографию или PDF чека. Можно отправить только файл, без текста.`, null, "receipt_prompt");
+}
+
+async function showClientCabinet(env, updateId, chatId, userId) {
+  const client = await first(env.DB, "SELECT * FROM clients WHERE telegram_user_id=? AND status='active' LIMIT 1", String(userId));
+  if (!client) return sendUserText(env, updateId, chatId, "Доступ к кабинету пока не открыт. Оставьте заявку — после проверки администратор подключит профиль.", USER_MENU, "cabinet_not_authorized");
+  const services = await all(
+    env.DB,
+    `SELECT s.*,
+       (SELECT pe.created_at FROM payment_events pe WHERE pe.service_id=s.id AND pe.action IN ('approved','manual_approved') ORDER BY pe.id DESC LIMIT 1) AS last_payment_at,
+       (SELECT pe.amount_minor FROM payment_events pe WHERE pe.service_id=s.id AND pe.action IN ('approved','manual_approved') ORDER BY pe.id DESC LIMIT 1) AS last_payment_amount,
+       (SELECT COUNT(*) FROM receipts r WHERE r.service_id=s.id AND r.status='pending') AS pending_receipts
+     FROM services s WHERE s.client_id=? AND s.status='active' ORDER BY s.id DESC LIMIT 12`,
+    client.id,
+  );
+  const lines = services.map((service) => {
+    const baseStatus = service.payment_status === "paid" ? "Текущий период оплачен" : service.payment_status === "pending" ? "Чек проверяется" : "Ожидает оплаты";
+    const status = Number(service.pending_receipts) > 0 ? `${baseStatus}; новый чек на проверке` : baseStatus;
+    const lastPayment = service.last_payment_at
+      ? `Последняя подтверждённая оплата: ${String(service.last_payment_at).slice(0, 10)}${service.last_payment_amount == null ? "" : ` · ${formatMoney(service.last_payment_amount, service.currency)}`}`
+      : "Подтверждённых оплат пока нет";
+    return `• ${service.site_name}\n  Статус: ${status}\n  Оплачено по: ${service.valid_through}\n  Стоимость: ${formatMoney(service.monthly_price_minor, service.currency)} / месяц\n  ${lastPayment}`;
+  });
+  const text = `Кабинет K web\nКлиент: ${client.full_name}\nTelegram: ${client.telegram_username || "ник не задан"}\nE-mail: ${client.email || "не указан"}\n\n${lines.length ? lines.join("\n\n") : "Активных сайтов пока нет."}`;
+  return sendUserText(env, updateId, chatId, text, inline([[button("Отправить чек (фото/PDF)", "receipt:start")], [button("Обновить", "cabinet")]]), "client_cabinet");
 }
 
 async function askPhone(env, updateId, chatId) {
@@ -382,9 +424,11 @@ async function finishClientRequest(env, updateId, message, state) {
   const now = nowIso();
   const result = await run(
     env.DB,
-    `INSERT INTO service_requests(telegram_user_id, full_name, phone, site_url, details, status, created_at, updated_at)
-     VALUES(?, ?, ?, ?, ?, 'new', ?, ?)`,
+    `INSERT INTO service_requests(telegram_user_id, telegram_username, email, full_name, phone, site_url, details, status, created_at, updated_at)
+     VALUES(?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)`,
     userId,
+    normalizeTelegramUsername(message.from?.username) ?? null,
+    data.email ?? null,
     data.full_name,
     data.phone,
     data.site_url,
@@ -394,7 +438,8 @@ async function finishClientRequest(env, updateId, message, state) {
   );
   const requestId = Number(result.meta?.last_row_id);
   await clearSession(env.DB, userId);
-  const summary = `Новая заявка #${requestId}\nКлиент: ${data.full_name}\nТелефон: ${data.phone}\nСайт: ${data.site_url}\nОписание: ${data.details}\nTelegram ID: ${userId}`;
+  const telegramUsername = normalizeTelegramUsername(message.from?.username);
+  const summary = `Новая заявка #${requestId}\nКлиент: ${data.full_name}\nТелефон: ${data.phone}\nTelegram: ${telegramUsername || "ник не задан"}\nE-mail: ${data.email}\nСайт: ${data.site_url}\nОписание: ${data.details}`;
   const event = await recordEvent(env, {
     actorId: userId,
     action: "service_request_submitted",
@@ -435,13 +480,14 @@ async function identifyService(env, userId, siteText) {
   return linked.length === 1 ? linked[0] : null;
 }
 
-function receiptCaption({ receiptId, clientName, siteName, siteUrl, periodEnd, amountMinor, note }) {
+function receiptCaption({ receiptId, clientName, siteName, siteUrl, periodEnd, amountMinor, note, lastPayment }) {
   return [
     `ЧЕК #${receiptId} — ОЖИДАЕТ ПРОВЕРКИ`,
     `Клиент: ${clientName || "не определён"}`,
     `Сайт: ${siteName || siteUrl || "не указан"}`,
     `Дата: ${localDateString()}`,
     periodEnd ? `Оплаченный период до: ${periodEnd}` : null,
+    lastPayment ? `Последняя подтверждённая оплата: ${String(lastPayment.created_at).slice(0, 10)}${lastPayment.amount_minor == null ? "" : ` · ${formatMoney(lastPayment.amount_minor)}`}` : "Подтверждённых оплат пока нет",
     amountMinor == null ? "Сумма: не указана" : `Сумма: ${formatMoney(amountMinor)}`,
     note ? `Подпись клиента: ${cleanText(note, 180)}` : null,
   ].filter(Boolean).join("\n");
@@ -451,7 +497,23 @@ async function createReceipt(env, updateId, message, state, media) {
   const userId = String(message.from.id);
   const chatId = userChatId(message);
   const data = state.data;
-  const service = await identifyService(env, userId, data.site_text);
+  const service = await first(
+    env.DB,
+    `SELECT s.*, c.full_name, c.phone, c.telegram_username, c.email
+     FROM services s JOIN clients c ON c.id=s.client_id
+     WHERE s.id=? AND s.status='active' AND c.status='active' AND c.telegram_user_id=?`,
+    Number(data.service_id),
+    userId,
+  );
+  if (!service) {
+    await clearSession(env.DB, userId);
+    return sendUserText(env, updateId, chatId, "Не удалось проверить ваш доступ к этому сайту. Откройте кабинет и выберите сайт заново.", inline([[button("Мой кабинет", "cabinet")]]), "receipt_owner_check");
+  }
+  const lastPayment = await first(
+    env.DB,
+    "SELECT created_at, amount_minor FROM payment_events WHERE service_id=? AND action IN ('approved','manual_approved') ORDER BY id DESC LIMIT 1",
+    service.id,
+  );
   const now = nowIso();
   const result = await run(
     env.DB,
@@ -459,15 +521,15 @@ async function createReceipt(env, updateId, message, state, media) {
       client_id, service_id, period_end, telegram_user_id, source_chat_id,
       source_message_id, file_id, media_type, amount_minor, currency, status, created_at, updated_at
     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUB', 'pending', ?, ?)`,
-    service?.client_id ?? null,
-    service?.id ?? null,
-    service?.valid_through ?? null,
+    service.client_id,
+    service.id,
+    service.valid_through,
     userId,
     String(message.chat.id),
     Number(message.message_id),
     media.file_id,
     media.media_type,
-    data.amount_minor ?? null,
+    null,
     now,
     now,
   );
@@ -479,34 +541,35 @@ async function createReceipt(env, updateId, message, state, media) {
     env.DB,
     `INSERT INTO payment_events(service_id, receipt_id, action, amount_minor, currency, period_end_before, actor_telegram_id, note, created_at)
      VALUES(?, ?, 'receipt_submitted', ?, 'RUB', ?, ?, ?, ?)`,
-    service?.id ?? null,
+    service.id,
     receiptId,
-    data.amount_minor ?? null,
-    service?.valid_through ?? null,
+    null,
+    service.valid_through,
     userId,
-    data.site_text,
+    "Чек из кабинета клиента; сумму проверяет администратор",
     now,
   );
   await clearSession(env.DB, userId);
   const caption = receiptCaption({
     receiptId,
-    clientName: service?.full_name,
-    siteName: service?.site_name,
-    siteUrl: data.site_text || service?.site_url,
-    periodEnd: service?.valid_through,
-    amountMinor: data.amount_minor,
-    note: message.caption,
+    clientName: service.full_name,
+    siteName: service.site_name,
+    siteUrl: service.site_url,
+    periodEnd: service.valid_through,
+    amountMinor: null,
+    note: null,
+    lastPayment,
   });
   await enqueueArchiveCopy(env, {
     key: `archive:receipt:${receiptId}:copy`,
     fromChatId: message.chat.id,
     messageId: message.message_id,
     caption,
-    serviceId: service?.id ?? null,
-    periodEnd: service?.valid_through ?? null,
+    serviceId: service.id,
+    periodEnd: service.valid_through,
     receiptId,
   });
-  const adminText = `${caption}\nTelegram ID: ${userId}`;
+  const adminText = `${caption}\nТелефон: ${service.phone || "не указан"}\nTelegram: ${service.telegram_username || "ник не задан"}\nE-mail: ${service.email || "не указан"}`;
   const buttons = service
     ? inline([[button("Подтвердить оплату", `receipt:approve:${receiptId}`), button("Отклонить", `receipt:reject:${receiptId}`)], [button("Открыть", `receipt:view:${receiptId}`)]])
     : inline([[button("Привязать к сайту", `receipt:link:${receiptId}`), button("Отклонить", `receipt:reject:${receiptId}`)], [button("Открыть", `receipt:view:${receiptId}`)]]);
@@ -517,7 +580,7 @@ async function createReceipt(env, updateId, message, state, media) {
     entityType: "receipt",
     entityId: receiptId,
     details: { serviceId: service?.id ?? null },
-    archiveText: `Получен чек #${receiptId}. Статус: ожидает ручной проверки. Оплата не подтверждена.\nКлиент: ${service?.full_name || "не определён"}\nСайт: ${service?.site_name || data.site_text}\nДата: ${localDateString()}`,
+    archiveText: `Получен чек #${receiptId}. Статус: ожидает ручной проверки. Оплата не подтверждена.\nКлиент: ${service.full_name}\nТелефон: ${service.phone || "не указан"}\nTelegram: ${service.telegram_username || "ник не задан"}\nE-mail: ${service.email || "не указан"}\nСайт: ${service.site_name}\n${lastPayment ? `Последняя подтверждённая оплата: ${String(lastPayment.created_at).slice(0, 10)}${lastPayment.amount_minor == null ? "" : ` · ${formatMoney(lastPayment.amount_minor)}`}` : "Подтверждённых оплат пока нет"}\nДата чека: ${localDateString()}`,
     archiveKey: `archive:receipt:${receiptId}:event`,
   });
   await sendUserText(
@@ -535,7 +598,9 @@ function extractMedia(message) {
     const photo = message.photo.at(-1);
     return photo?.file_id ? { file_id: photo.file_id, media_type: "photo" } : null;
   }
-  if (message.document?.file_id) return { file_id: message.document.file_id, media_type: "document" };
+  if (message.document?.file_id && (message.document.mime_type === "application/pdf" || message.document.mime_type?.startsWith("image/"))) {
+    return { file_id: message.document.file_id, media_type: "document" };
+  }
   return null;
 }
 
@@ -555,11 +620,18 @@ async function handleAdminCreationStep(env, updateId, message, session) {
         return sendUserText(env, updateId, chatId, "Введите телефон клиента или `-`, если его пока нет.", null, "admin_prompt");
       case "phone":
         data.phone = skip ? null : text.slice(0, 80);
-        await saveSession(env.DB, userId, { flow: session.flow, step: "telegram", data });
-        return sendUserText(env, updateId, chatId, "Введите числовой Telegram ID клиента для напоминаний или `-`, если пока неизвестен.", null, "admin_prompt");
-      case "telegram":
-        if (!skip && !/^\d{4,20}$/.test(text)) return sendUserText(env, updateId, chatId, "Нужен числовой Telegram ID или `-`.", null, "admin_prompt");
-        data.telegram_user_id = skip ? null : text;
+        await saveSession(env.DB, userId, { flow: session.flow, step: "telegram_username", data });
+        return sendUserText(env, updateId, chatId, "Введите Telegram-ник клиента, например @username, или `-`, если его нет.", null, "admin_prompt");
+      case "telegram_username": {
+        const username = skip ? null : normalizeTelegramUsername(text);
+        if (!skip && username === undefined) return sendUserText(env, updateId, chatId, "Введите ник вида @username (5–32 символа) или `-`.", null, "admin_prompt");
+        data.telegram_username = username;
+        await saveSession(env.DB, userId, { flow: session.flow, step: "email", data });
+        return sendUserText(env, updateId, chatId, "Введите e-mail клиента или `-`, если пока неизвестен.", null, "admin_prompt");
+      }
+      case "email":
+        if (!skip && !isValidEmail(text)) return sendUserText(env, updateId, chatId, "Введите корректный e-mail или `-`.", null, "admin_prompt");
+        data.email = skip ? null : text.toLowerCase();
         await saveSession(env.DB, userId, { flow: session.flow, step: "site_name", data });
         return sendUserText(env, updateId, chatId, "Введите название первого сайта клиента.", null, "admin_prompt");
       case "site_name":
@@ -585,10 +657,12 @@ async function handleAdminCreationStep(env, updateId, message, session) {
         const now = nowIso();
         const client = await run(
           env.DB,
-          "INSERT INTO clients(full_name, phone, telegram_user_id, created_at, updated_at) VALUES(?, ?, ?, ?, ?)",
+          "INSERT INTO clients(full_name, phone, telegram_user_id, telegram_username, email, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
           data.full_name,
           data.phone,
-          data.telegram_user_id,
+          data.telegram_user_id ?? null,
+          data.telegram_username ?? null,
+          data.email ?? null,
           now,
           now,
         );
@@ -609,7 +683,7 @@ async function handleAdminCreationStep(env, updateId, message, session) {
         );
         const serviceId = Number(service.meta?.last_row_id);
         await clearSession(env.DB, userId);
-        const summary = `Добавлен клиент #${clientId}: ${data.full_name}\nТелефон: ${data.phone || "не указан"}\nСайт: ${data.site_name} — ${data.site_url}\nСтоимость: ${formatMoney(data.monthly_price_minor)} в месяц\nОплачено по: ${data.valid_through}`;
+        const summary = `Добавлен клиент #${clientId}: ${data.full_name}\nТелефон: ${data.phone || "не указан"}\nTelegram: ${data.telegram_username || "ник не указан"}\nE-mail: ${data.email || "не указан"}\nСайт: ${data.site_name} — ${data.site_url}\nСтоимость: ${formatMoney(data.monthly_price_minor)} в месяц\nОплачено по: ${data.valid_through}`;
         await recordEvent(env, {
           actorId: userId,
           action: "client_and_service_created",
@@ -619,6 +693,19 @@ async function handleAdminCreationStep(env, updateId, message, session) {
           archiveText: summary,
           archiveKey: `archive:client:${clientId}:created`,
         });
+        if (data.telegram_user_id) {
+          await enqueueText(env, {
+            target: "user",
+            chatId: data.telegram_user_id,
+            key: `client:${clientId}:activated:${data.telegram_user_id}`,
+            text: `Вам открыт кабинет K web. Клиент: ${data.full_name}. Сайт: ${data.site_name}. Оплачено по: ${data.valid_through}. Откройте «Мой кабинет», чтобы посмотреть оплату и отправить фото/PDF чека.`,
+            keyboard: USER_MENU,
+            category: "client_activated",
+          });
+          if (session.requestId) {
+            await run(env.DB, "UPDATE service_requests SET status='handled', updated_at=? WHERE id=? AND status='new'", now, Number(session.requestId));
+          }
+        }
         return displayAdminMenu(env, updateId, chatId, `Клиент и первый сайт добавлены.\n${summary}`);
       }
     }
@@ -702,10 +789,14 @@ async function handleEditStep(env, updateId, message, session) {
     } else if (session.field === "phone") {
       column = "phone";
       value = ["-", "—"].includes(text) ? null : text.slice(0, 80);
-    } else if (session.field === "telegram") {
-      if (!["-", "—"].includes(text) && !/^\d{4,20}$/.test(text)) return sendUserText(env, updateId, chatId, "Введите числовой Telegram ID или `-`.", null, "edit_prompt");
-      column = "telegram_user_id";
-      value = ["-", "—"].includes(text) ? null : text;
+    } else if (session.field === "telegram_username") {
+      if (!["-", "—"].includes(text) && normalizeTelegramUsername(text) === undefined) return sendUserText(env, updateId, chatId, "Введите ник вида @username (5–32 символа) или `-`.", null, "edit_prompt");
+      column = "telegram_username";
+      value = ["-", "—"].includes(text) ? null : normalizeTelegramUsername(text);
+    } else if (session.field === "email") {
+      if (!["-", "—"].includes(text) && !isValidEmail(text)) return sendUserText(env, updateId, chatId, "Введите корректный e-mail или `-`.", null, "edit_prompt");
+      column = "email";
+      value = ["-", "—"].includes(text) ? null : text.toLowerCase();
     }
     if (!column) return sendUserText(env, updateId, chatId, "Неизвестное поле.", null, "edit_result");
     await run(env.DB, `UPDATE clients SET ${column}=?, updated_at=? WHERE id=?`, value, now, client.id);
@@ -800,9 +891,15 @@ async function handleUserSession(env, updateId, message, session) {
       const phone = cleanText(contact?.phone_number ?? text, 80);
       if (phone.replace(/\D/g, "").length < 6) return sendUserText(env, updateId, chatId, "Введите корректный телефон или поделитесь контактом.", null, "request_phone_prompt");
       data.phone = phone;
-      await saveSession(env.DB, userId, { flow: "request", step: "site", data });
-      await removeReplyKeyboard(env, updateId, chatId, "Укажите адрес сайта. Если сайта ещё нет, напишите «пока нет».");
+      await saveSession(env.DB, userId, { flow: "request", step: "email", data });
+      await removeReplyKeyboard(env, updateId, chatId, "Введите e-mail для связи.");
       return;
+    }
+    if (session.step === "email") {
+      if (!isValidEmail(text)) return sendUserText(env, updateId, chatId, "Введите корректный e-mail, например name@example.com.", null, "request_prompt");
+      data.email = text.toLowerCase();
+      await saveSession(env.DB, userId, { flow: "request", step: "site", data });
+      return sendUserText(env, updateId, chatId, "Укажите адрес сайта. Если сайта ещё нет, напишите «пока нет».", null, "request_prompt");
     }
     if (session.step === "site") {
       if (!text || text.length > 500) return sendUserText(env, updateId, chatId, "Введите адрес сайта или «пока нет».", null, "request_prompt");
@@ -818,28 +915,9 @@ async function handleUserSession(env, updateId, message, session) {
   }
 
   if (session.flow === "receipt") {
-    if (session.step === "site") {
-      if (!text || text.length > 500) return sendUserText(env, updateId, chatId, "Укажите адрес или название сайта.", null, "receipt_prompt");
-      data.site_text = text;
-      const service = await identifyService(env, userId, text);
-      data.service_id = service?.id ?? null;
-      data.client_id = service?.client_id ?? null;
-      data.period_end = service?.valid_through ?? null;
-      await saveSession(env.DB, userId, { flow: "receipt", step: "amount", data });
-      return sendUserText(env, updateId, chatId, "Введите сумму из чека в ₽ или отправьте `-`, если она не указана.", null, "receipt_prompt");
-    }
-    if (session.step === "amount") {
-      const amount = ["-", "—", "нет", "не знаю"].includes(text.toLowerCase()) ? null : parseMoneyMinor(text);
-      if (amount == null && !["-", "—", "нет", "не знаю"].includes(text.toLowerCase())) {
-        return sendUserText(env, updateId, chatId, "Введите сумму числом, например 5000, или отправьте `-`.", null, "receipt_prompt");
-      }
-      data.amount_minor = amount;
-      await saveSession(env.DB, userId, { flow: "receipt", step: "proof", data });
-      return sendUserText(env, updateId, chatId, "Теперь отправьте чек фотографией или документом.", null, "receipt_prompt");
-    }
     if (session.step === "proof") {
       const media = extractMedia(message);
-      if (!media) return sendUserText(env, updateId, chatId, "Отправьте фото или документ с чеком.", null, "receipt_prompt");
+      if (!media) return sendUserText(env, updateId, chatId, "В этом шаге можно отправить только фотографию или PDF чека — без текстового сообщения.", null, "receipt_prompt");
       return createReceipt(env, updateId, message, session, media);
     }
   }
@@ -879,7 +957,7 @@ async function showClient(env, updateId, chatId, clientId, prefix = "") {
   rows.push([button("Добавить сайт", `service:add:${client.id}`), button("Изменить данные", `client:edit:${client.id}`)]);
   rows.push([button("Архивировать клиента", `client:archive:${client.id}`), button("Назад", "clients:1")]);
   const serviceList = services.length ? `\nСайты: ${services.length}` : "\nАктивных сайтов нет.";
-  const text = `${prefix ? `${prefix}\n\n` : ""}Клиент #${client.id}: ${client.full_name}\nТелефон: ${client.phone || "не указан"}\nTelegram ID: ${client.telegram_user_id || "не привязан"}${serviceList}`;
+  const text = `${prefix ? `${prefix}\n\n` : ""}Клиент #${client.id}: ${client.full_name}\nТелефон: ${client.phone || "не указан"}\nTelegram: ${client.telegram_username || "ник не указан"}\nE-mail: ${client.email || "не указан"}\nКабинет: ${client.telegram_user_id ? "подключён" : "не подключён"}${serviceList}`;
   return sendUserText(env, updateId, chatId, text, inline(rows), "admin_detail");
 }
 
@@ -954,7 +1032,7 @@ async function showPayments(env, updateId, chatId) {
 async function showReceipt(env, updateId, chatId, receiptId, prefix = "") {
   const receipt = await first(
     env.DB,
-    `SELECT r.*, c.full_name, c.phone, s.site_name, s.site_url, s.valid_through, s.monthly_price_minor
+    `SELECT r.*, c.full_name, c.phone, c.telegram_username, c.email, s.site_name, s.site_url, s.valid_through, s.monthly_price_minor
      FROM receipts r LEFT JOIN clients c ON c.id=r.client_id
      LEFT JOIN services s ON s.id=r.service_id WHERE r.id=?`,
     Number(receiptId),
@@ -967,7 +1045,7 @@ async function showReceipt(env, updateId, chatId, receiptId, prefix = "") {
     rows.push([button("Привязать к сайту", `receipt:link:${receipt.id}`), button("Отклонить", `receipt:reject:${receipt.id}`)]);
   }
   rows.push([button("К списку", "payments:1"), button("В меню", "menu:admin")]);
-  const text = `${prefix ? `${prefix}\n\n` : ""}Чек #${receipt.id}\nСтатус: ${receipt.status === "pending" ? "ожидает ручной проверки" : receipt.status === "approved" ? "подтверждён" : "отклонён"}\nКлиент: ${receipt.full_name || "не определён"}\nТелефон: ${receipt.phone || "не указан"}\nСайт: ${receipt.site_name || "не привязан"}${receipt.site_url ? ` — ${receipt.site_url}` : ""}\nСумма: ${receipt.amount_minor == null ? "не указана" : formatMoney(receipt.amount_minor)}\nДата получения: ${receipt.created_at}\nПериод до проверки: ${receipt.period_end || "не определён"}\nTelegram ID: ${receipt.telegram_user_id}`;
+  const text = `${prefix ? `${prefix}\n\n` : ""}Чек #${receipt.id}\nСтатус: ${receipt.status === "pending" ? "ожидает ручной проверки" : receipt.status === "approved" ? "подтверждён" : "отклонён"}\nКлиент: ${receipt.full_name || "не определён"}\nТелефон: ${receipt.phone || "не указан"}\nTelegram: ${receipt.telegram_username || "ник не задан"}\nE-mail: ${receipt.email || "не указан"}\nСайт: ${receipt.site_name || "не привязан"}${receipt.site_url ? ` — ${receipt.site_url}` : ""}\nСумма: ${receipt.amount_minor == null ? "не указана" : formatMoney(receipt.amount_minor)}\nДата получения: ${receipt.created_at}\nОплачено до проверки: ${receipt.period_end || "не определено"}`;
   return sendUserText(env, updateId, chatId, text, inline(rows), "admin_detail");
 }
 
@@ -1008,10 +1086,28 @@ async function showRequest(env, updateId, chatId, requestId) {
   const request = await first(env.DB, "SELECT * FROM service_requests WHERE id=?", Number(requestId));
   if (!request) return sendUserText(env, updateId, chatId, "Заявка не найдена.", inline(backToAdmin()), "admin_detail");
   const rows = [];
-  if (request.status === "new") rows.push([button("Отметить обработанной", `request:handled:${request.id}`), button("Закрыть", `request:close:${request.id}`)]);
+  if (request.status === "new") {
+    rows.push([button("Создать профиль и открыть доступ", `request:provision:${request.id}`)]);
+    rows.push([button("Отметить обработанной", `request:handled:${request.id}`), button("Закрыть", `request:close:${request.id}`)]);
+  }
   rows.push([button("К заявкам", "requests:1"), button("В меню", "menu:admin")]);
-  const text = `Заявка #${request.id}\nСтатус: ${request.status}\nКлиент: ${request.full_name}\nТелефон: ${request.phone}\nСайт: ${request.site_url}\nОписание: ${request.details}\nTelegram ID: ${request.telegram_user_id}\nДата: ${request.created_at}`;
+  const text = `Заявка #${request.id}\nСтатус: ${request.status}\nКлиент: ${request.full_name}\nТелефон: ${request.phone}\nTelegram: ${request.telegram_username || "ник не задан"}\nE-mail: ${request.email || "не указан"}\nСайт: ${request.site_url}\nОписание: ${request.details}\nДата: ${request.created_at}`;
   return sendUserText(env, updateId, chatId, text, inline(rows), "admin_detail");
+}
+
+async function provisionRequest(env, updateId, chatId, adminId, requestId) {
+  const request = await first(env.DB, "SELECT * FROM service_requests WHERE id=? AND status='new'", Number(requestId));
+  if (!request) return showRequest(env, updateId, chatId, requestId, "Заявка уже обработана или не найдена.");
+  const username = request.telegram_username ? normalizeTelegramUsername(request.telegram_username) : null;
+  const data = {
+    full_name: request.full_name,
+    phone: request.phone,
+    telegram_username: username || null,
+    email: request.email || null,
+    telegram_user_id: request.telegram_user_id,
+  };
+  await saveSession(env.DB, adminId, { flow: "new_client", step: "site_name", data, requestId: Number(request.id) });
+  return sendUserText(env, updateId, chatId, `Подключение клиента ${request.full_name}. Введите название первого сайта. После заполнения сайта, тарифа и даты кабинет будет привязан к Telegram аккаунту заявки, а клиент получит уведомление.`, null, "admin_prompt");
 }
 
 async function showHistory(env, updateId, chatId, serviceId = null) {
@@ -1038,11 +1134,11 @@ async function showBackup(env, updateId, chatId, adminId) {
   }
   const services = await all(
     env.DB,
-    `SELECT c.full_name, c.phone, c.telegram_user_id, s.site_name, s.site_url,
+    `SELECT c.full_name, c.phone, c.telegram_username, c.email, s.site_name, s.site_url,
        s.monthly_price_minor, s.currency, s.valid_through, s.payment_status, s.status
      FROM services s JOIN clients c ON c.id=s.client_id ORDER BY c.full_name, s.site_name LIMIT 10000`,
   );
-  const csvHeaders = ["full_name", "phone", "telegram_user_id", "site_name", "site_url", "monthly_price_minor", "currency", "valid_through", "payment_status", "status"];
+  const csvHeaders = ["full_name", "phone", "telegram_username", "email", "site_name", "site_url", "monthly_price_minor", "currency", "valid_through", "payment_status", "status"];
   const csv = toCsv(services, csvHeaders);
   const date = localDateString();
   try {
@@ -1078,13 +1174,13 @@ async function showBackup(env, updateId, chatId, adminId) {
 async function exportCsv(env, updateId, chatId, adminId) {
   const rows = await all(
     env.DB,
-    `SELECT c.full_name, c.phone, c.telegram_user_id, c.status AS client_status,
+    `SELECT c.full_name, c.phone, c.telegram_username, c.email, c.status AS client_status,
        s.site_name, s.site_url, s.monthly_price_minor, s.currency, s.valid_through,
        s.payment_status, s.status AS service_status
      FROM clients c LEFT JOIN services s ON s.client_id=c.id
      ORDER BY c.full_name, s.site_name LIMIT 10000`,
   );
-  const headers = ["full_name", "phone", "telegram_user_id", "client_status", "site_name", "site_url", "monthly_price_minor", "currency", "valid_through", "payment_status", "service_status"];
+  const headers = ["full_name", "phone", "telegram_username", "email", "client_status", "site_name", "site_url", "monthly_price_minor", "currency", "valid_through", "payment_status", "service_status"];
   const csv = toCsv(rows, headers);
   try {
     await telegramSendDocument(env, chatId, `kweb-clients-${localDateString()}.csv`, csv, "text/csv; charset=utf-8");
@@ -1157,14 +1253,14 @@ async function approveReceipt(env, updateId, chatId, adminId, receiptId) {
   ]);
   if (!results[0]?.meta?.changes || !results[1]?.meta?.changes) return showReceipt(env, updateId, chatId, receipt.id, "Период уже был изменён другим действием. Обновите карточку и проверьте оплату.");
   const client = await first(env.DB, "SELECT * FROM clients WHERE id=?", service.client_id);
-  const text = `Оплата чека #${receipt.id} подтверждена. Сайт: ${service.site_name}. Сумма: ${formatMoney(amount, service.currency)}. Новый оплаченный период до ${nextDate}.`;
+  const text = `Оплата чека #${receipt.id} подтверждена. Сайт: ${service.site_name}. Сумма: ${formatMoney(amount, service.currency)}. Новый оплаченный период до ${nextDate}. Откройте «Мой кабинет», чтобы посмотреть актуальный статус.`;
   await recordEvent(env, {
     actorId: adminId,
     action: "payment_approved",
     entityType: "receipt",
     entityId: receipt.id,
     details: { serviceId: service.id, oldEnd: service.valid_through, newEnd: nextDate, amountMinor: amount },
-    archiveText: `${text}\nКлиент: ${client?.full_name || "не указан"}. Подтвердил администратор Telegram ID ${adminId}.`,
+    archiveText: `${text}\nКлиент: ${client?.full_name || "не указан"}\nТелефон: ${client?.phone || "не указан"}\nTelegram: ${client?.telegram_username || "ник не задан"}\nE-mail: ${client?.email || "не указан"}\nДата подтверждения: ${localDateString()}`,
     archiveKey: `archive:receipt:${receipt.id}:approved`,
   });
   if (client?.telegram_user_id) {
@@ -1173,6 +1269,7 @@ async function approveReceipt(env, updateId, chatId, adminId, receiptId) {
       chatId: client.telegram_user_id,
       key: `receipt:${receipt.id}:approved:user`,
       text,
+      keyboard: USER_MENU,
       category: "payment_result",
       serviceId: service.id,
       periodEnd: nextDate,
@@ -1211,7 +1308,7 @@ async function rejectReceipt(env, updateId, chatId, adminId, receiptId) {
     const pending = await first(env.DB, "SELECT COUNT(*) AS count FROM receipts WHERE service_id=? AND status='pending'", receipt.service_id);
     if (!Number(pending?.count)) await run(env.DB, "UPDATE services SET payment_status='unpaid', updated_at=? WHERE id=? AND payment_status='pending'", now, receipt.service_id);
   }
-  const client = receipt.client_id ? await first(env.DB, "SELECT full_name FROM clients WHERE id=?", receipt.client_id) : null;
+  const client = receipt.client_id ? await first(env.DB, "SELECT * FROM clients WHERE id=?", receipt.client_id) : null;
   const text = `Чек #${receipt.id} отклонён после проверки. Оплата не подтверждена. Клиент: ${client?.full_name || "не определён"}.`;
   await recordEvent(env, {
     actorId: adminId,
@@ -1219,7 +1316,7 @@ async function rejectReceipt(env, updateId, chatId, adminId, receiptId) {
     entityType: "receipt",
     entityId: receipt.id,
     details: { serviceId: receipt.service_id },
-    archiveText: `${text}\nАдминистратор Telegram ID ${adminId}.`,
+    archiveText: `${text}\nТелефон: ${client?.phone || "не указан"}\nTelegram: ${client?.telegram_username || "ник не задан"}\nE-mail: ${client?.email || "не указан"}\nДата проверки: ${localDateString()}`,
     archiveKey: `archive:receipt:${receipt.id}:rejected`,
   });
   await enqueueText(env, {
@@ -1227,6 +1324,7 @@ async function rejectReceipt(env, updateId, chatId, adminId, receiptId) {
     chatId: receipt.telegram_user_id,
     key: `receipt:${receipt.id}:rejected:user`,
     text: "Чек проверен, но оплата не подтверждена. Свяжитесь с администратором, если считаете это ошибкой.",
+    keyboard: USER_MENU,
     category: "payment_result",
   });
   await sendUserText(env, updateId, chatId, "Чек отклонён; подписка не продлена.", inline(backToAdmin()), "receipt_result");
@@ -1235,7 +1333,7 @@ async function rejectReceipt(env, updateId, chatId, adminId, receiptId) {
 async function manualPayment(env, updateId, chatId, adminId, serviceId) {
   const service = await first(
     env.DB,
-    `SELECT s.*, c.full_name, c.telegram_user_id FROM services s JOIN clients c ON c.id=s.client_id WHERE s.id=?`,
+    `SELECT s.*, c.full_name, c.telegram_user_id, c.telegram_username, c.email, c.phone FROM services s JOIN clients c ON c.id=s.client_id WHERE s.id=?`,
     Number(serviceId),
   );
   if (!service || service.status !== "active") return sendUserText(env, updateId, chatId, "Активный сайт не найден.", inline(backToAdmin()), "payment_result");
@@ -1262,14 +1360,14 @@ async function manualPayment(env, updateId, chatId, adminId, serviceId) {
       .bind(service.id, service.valid_through, service.id, nextDate),
   ]);
   if (!results[0]?.meta?.changes) return showService(env, updateId, chatId, service.id, "Сайт изменился во время подтверждения. Обновите карточку и повторите проверку.");
-  const text = `Оплата подтверждена администратором. Сайт: ${service.site_name}. Сумма: ${formatMoney(service.monthly_price_minor, service.currency)}. Новый оплаченный период до ${nextDate}.`;
+  const text = `Оплата подтверждена администратором. Сайт: ${service.site_name}. Сумма: ${formatMoney(service.monthly_price_minor, service.currency)}. Новый оплаченный период до ${nextDate}. Откройте «Мой кабинет», чтобы посмотреть актуальный статус.`;
   await recordEvent(env, {
     actorId: adminId,
     action: "manual_payment_approved",
     entityType: "service",
     entityId: service.id,
     details: { oldEnd: service.valid_through, newEnd: nextDate, amountMinor: service.monthly_price_minor },
-    archiveText: `${text}\nКлиент: ${service.full_name}. Администратор Telegram ID ${adminId}.`,
+    archiveText: `${text}\nКлиент: ${service.full_name}\nТелефон: ${service.phone || "не указан"}\nTelegram: ${service.telegram_username || "ник не задан"}\nE-mail: ${service.email || "не указан"}\nДата подтверждения: ${localDateString()}`,
     archiveKey: `archive:service:${service.id}:manual-payment:${now}`,
   });
   if (service.telegram_user_id) {
@@ -1278,6 +1376,7 @@ async function manualPayment(env, updateId, chatId, adminId, serviceId) {
       chatId: service.telegram_user_id,
       key: `service:${service.id}:manual-payment:${nextDate}:user`,
       text,
+      keyboard: USER_MENU,
       category: "payment_result",
       serviceId: service.id,
       periodEnd: nextDate,
@@ -1400,7 +1499,7 @@ async function startEditClient(env, updateId, chatId, userId, clientId) {
   if (!client) return sendUserText(env, updateId, chatId, "Клиент не найден.", null, "edit_prompt");
   const rows = [
     [button("Имя", `client:editfield:${client.id}:name`), button("Телефон", `client:editfield:${client.id}:phone`)],
-    [button("Telegram ID", `client:editfield:${client.id}:telegram`)],
+    [button("Telegram-ник", `client:editfield:${client.id}:telegram_username`), button("E-mail", `client:editfield:${client.id}:email`)],
     [button("Назад", `client:view:${client.id}`)],
   ];
   return sendUserText(env, updateId, chatId, `Какие данные клиента ${client.full_name} изменить?`, inline(rows), "edit_menu");
@@ -1419,7 +1518,7 @@ async function startEditService(env, updateId, chatId, userId, serviceId) {
 
 async function startEditField(env, updateId, chatId, userId, type, id, field) {
   const prompts = {
-    client: { name: "Введите новое имя клиента.", phone: "Введите новый телефон или `-`, чтобы очистить.", telegram: "Введите числовой Telegram ID или `-`, чтобы отвязать." },
+    client: { name: "Введите новое имя клиента.", phone: "Введите новый телефон или `-`, чтобы очистить.", telegram_username: "Введите новый Telegram-ник, например @username, или `-`, чтобы очистить.", email: "Введите новый e-mail или `-`, чтобы очистить." },
     service: { name: "Введите новое название сайта.", url: "Введите полный URL сайта с https:// или http://.", price: "Введите новую ежемесячную стоимость в ₽.", date: "Введите последний оплаченный день в формате ГГГГ-ММ-ДД." },
   };
   if (!prompts[type]?.[field]) return sendUserText(env, updateId, chatId, "Неизвестное поле.", null, "edit_prompt");
@@ -1441,16 +1540,18 @@ async function handleCallback(env, updateId, callback) {
     // A stale callback query should not block the authorized action.
   }
   if (!chatId || callback.message?.chat?.type !== "private") return;
-  const customerAction = data === "request:start" || data === "receipt:start";
+  const customerAction = data === "request:start" || data === "receipt:start" || data === "cabinet" || /^receipt:service:\d+$/.test(data);
   const adminOnly = !customerAction && /^(clients:|services:|payments:|requests:|history|backup|export:|client:|service:|receipt:|request:)/.test(data);
   if (adminOnly && !isAdmin(userId, env)) {
-    return sendUserText(env, updateId, chatId, "У этой кнопки нет доступа для вашего Telegram ID.", USER_MENU, "access_denied");
+    return sendUserText(env, updateId, chatId, "У этой кнопки нет доступа. Откройте клиентское меню.", USER_MENU, "access_denied");
   }
 
   if (data === "menu:admin" && isAdmin(userId, env)) return displayAdminMenu(env, updateId, chatId);
   if (data === "menu:user") return displayUserMenu(env, updateId, chatId);
   if (data === "request:start") return startClientRequest(env, updateId, chatId, userId);
   if (data === "receipt:start") return startReceiptFlow(env, updateId, chatId, userId);
+  if (data === "cabinet") return showClientCabinet(env, updateId, chatId, userId);
+  if (/^receipt:service:\d+$/.test(data)) return startReceiptForService(env, updateId, chatId, userId, Number(data.split(":")[2]));
   if (/^clients:\d+$/.test(data)) return showClients(env, updateId, chatId, Number(data.split(":")[1]));
   if (/^services:\d+$/.test(data)) return showServices(env, updateId, chatId, Number(data.split(":")[1]));
   if (/^requests:\d+$/.test(data)) return showRequests(env, updateId, chatId, Number(data.split(":")[1]));
@@ -1509,6 +1610,7 @@ async function handleCallback(env, updateId, callback) {
     return linkReceipt(env, updateId, chatId, userId, Number(receiptId), Number(serviceId));
   }
   if (data.startsWith("request:view:")) return showRequest(env, updateId, chatId, Number(data.split(":")[2]));
+  if (data.startsWith("request:provision:")) return provisionRequest(env, updateId, chatId, userId, Number(data.split(":")[2]));
   if (data.startsWith("request:handled:")) return markRequest(env, updateId, chatId, userId, Number(data.split(":")[2]), "handled");
   if (data.startsWith("request:close:")) return markRequest(env, updateId, chatId, userId, Number(data.split(":")[2]), "closed");
   return sendUserText(env, updateId, chatId, "Кнопка устарела. Откройте меню заново.", isAdmin(userId, env) ? ADMIN_MENU : USER_MENU, "stale_button");
@@ -1565,7 +1667,7 @@ async function handleMessage(env, updateId, message) {
   if (command === "help") {
     return isAdmin(userId, env)
       ? displayAdminMenu(env, updateId, chatId, "Команды: /start, /cancel, /backup. Для архива добавьте бота в закрытую группу и отправьте /setarchive.")
-      : displayUserMenu(env, updateId, chatId, "Нажмите кнопку, чтобы оставить заявку или отправить чек.");
+      : displayUserMenu(env, updateId, chatId, "Используйте кнопки кабинета: заявка, просмотр оплаты и отправка фото/PDF чека.");
   }
   if (command === "backup") {
     if (!isAdmin(userId, env)) return sendUserText(env, updateId, chatId, "Нет доступа.", null, "access_denied");
@@ -1587,10 +1689,10 @@ async function handleMessage(env, updateId, message) {
     return handleUserSession(env, updateId, message, session);
   }
   if (extractMedia(message) && !isAdmin(userId, env)) {
-    return sendUserText(env, updateId, chatId, "Сначала нажмите «Отправить чек», укажите сайт и сумму, затем отправьте фото или документ.", USER_MENU, "receipt_without_flow");
+    return sendUserText(env, updateId, chatId, "Сначала откройте «Мой кабинет», выберите сайт и только затем прикрепите фото или PDF чека.", USER_MENU, "receipt_without_flow");
   }
   if (isAdmin(userId, env)) return displayAdminMenu(env, updateId, chatId);
-  return displayUserMenu(env, updateId, chatId);
+  return displayUserMenu(env, updateId, chatId, "В кабинете нельзя отправлять произвольные сообщения. Используйте кнопки; при оплате отправляется только фото или PDF чека.");
 }
 
 async function handleUpdate(env, updateId, update) {
@@ -1739,8 +1841,8 @@ async function queueDailyReminders(env, date = localDateString(new Date(), env.A
         await run(env.DB, "UPDATE reminder_sends SET outbox_id=? WHERE service_id=? AND period_end=? AND milestone=?", outboxId, service.id, service.valid_through, milestone);
       } else {
         await run(env.DB, "UPDATE reminder_sends SET status='failed' WHERE service_id=? AND period_end=? AND milestone=?", service.id, service.valid_through, milestone);
-        await enqueueAdmins(env, `${key}:unlinked`, `${text}\nНапоминание не отправлено клиенту: Telegram ID не привязан.`, null, "reminder_unlinked");
-        await enqueueArchive(env, `${key}:archive`, `Напоминание не отправлено: ${text}\nПричина: Telegram ID клиента не привязан.`, "reminder_unlinked", service.id, service.valid_through);
+        await enqueueAdmins(env, `${key}:unlinked`, `${text}\nНапоминание не отправлено клиенту: кабинет Telegram не подключён.`, null, "reminder_unlinked");
+        await enqueueArchive(env, `${key}:archive`, `Напоминание не отправлено: ${text}\nПричина: кабинет Telegram клиента не подключён.`, "reminder_unlinked", service.id, service.valid_through);
       }
       void days;
     }

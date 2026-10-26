@@ -6,8 +6,10 @@ import {
   daysBetween,
   formatMoney,
   isIsoDate,
+  isValidEmail,
   isSafeHttpUrl,
   localDateString,
+  normalizeTelegramUsername,
   parseMoneyMinor,
   reminderMilestones,
   renewalDate,
@@ -66,4 +68,20 @@ test("CSV exports quote values and neutralize spreadsheet formulas", () => {
   assert.equal(csvCell('a,"b"'), '"a,""b"""');
   assert.equal(csvCell("=1+1"), "\"'=1+1\"");
   assert.match(toCsv([{ name: "=CMD()" }], ["name"]), /'=CMD\(\)/);
+});
+
+test("normalizes optional Telegram usernames without exposing numeric IDs", () => {
+  assert.equal(normalizeTelegramUsername("@Kweb_client"), "@Kweb_client");
+  assert.equal(normalizeTelegramUsername("Kweb_client"), "@Kweb_client");
+  assert.equal(normalizeTelegramUsername("-"), null);
+  assert.equal(normalizeTelegramUsername("123456789"), undefined);
+  assert.equal(normalizeTelegramUsername("bad space"), undefined);
+});
+
+test("validates e-mail addresses and rejects missing or malformed values", () => {
+  assert.equal(isValidEmail("client@example.com"), true);
+  assert.equal(isValidEmail("a+b@example.ru"), true);
+  assert.equal(isValidEmail("no-at.example.com"), false);
+  assert.equal(isValidEmail("client@localhost"), false);
+  assert.equal(isValidEmail(""), false);
 });
