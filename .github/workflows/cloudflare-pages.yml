@@ -1,0 +1,23 @@
+name: Deploy to Cloudflare Pages
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+permissions:
+  contents: read
+  deployments: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: 7a40b8466753962ea417bf20622b1292
+          command: pages deploy . --project-name=k-w --branch=main
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
