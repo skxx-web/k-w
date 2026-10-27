@@ -373,11 +373,13 @@ async function handleStart(env, updateId, message) {
     return;
   }
   await clearSession(env.DB, userId);
+  const linkPayload = String(message.text ?? "").match(/^\/start(?:@\w+)?\s+link_([A-Za-z0-9_-]{1,64})$/i)?.[1];
   if (isAdmin(userId, env)) {
     await displayAdminMenu(env, updateId, chatId);
   } else {
     const linked = await first(env.DB, "SELECT id FROM clients WHERE telegram_user_id=? AND status='active' LIMIT 1", userId);
     if (linked) return showClientCabinet(env, updateId, chatId, userId);
+    if (linkPayload) return handleClientLinkStart(env, updateId, message, chatId, userId, linkPayload);
     await displayUserMenu(env, updateId, chatId, "Здравствуйте! Чтобы подключить обслуживание, оставьте заявку.");
   }
 }
@@ -432,7 +434,7 @@ async function startReceiptUpload(env, updateId, chatId, userId) {
   return sendUserText(env, updateId, chatId, "Теперь прикрепите изображение или PDF-файл подтверждения оплаты. Другие сообщения не принимаются.", null, "receipt_upload_prompt");
 }
 
-async function showClientCabinet(env, updateId, chatId, userId) {
+async function showClientCabinet(env, updateId, chatId, userId, prefix = "") {
   const client = await first(env.DB, "SELECT * FROM clients WHERE telegram_user_id=? AND status='active' LIMIT 1", String(userId));
   if (!client) return sendUserText(env, updateId, chatId, "Доступ к кабинету пока не открыт. Оставьте заявку — после проверки администратор подключит профиль.", USER_MENU, "cabinet_not_authorized");
   const services = await all(
@@ -442,10 +444,47 @@ async function showClientCabinet(env, updateId, chatId, userId) {
      FROM services s WHERE s.client_id=? AND s.status='active' ORDER BY s.id DESC LIMIT 12`,
     client.id,
   );
-  return sendUserText(env, updateId, chatId, clientWelcomeText(services), inline([
+  return sendUserText(env, updateId, chatId, `${prefix ? `${prefix}\n\n` : ""}${clientWelcomeText(services)}`, inline([
     [button("Запросить реквизиты для оплаты", "receipt:start")],
     [button("Обновить", "cabinet")],
   ]), "client_cabinet");
+}
+
+async function handleClientLinkStart(env, updateId, message, chatId, userId, token) {
+  if (!/^[a-f0-9]{48}$/i.test(token)) return sendUserText(env, updateId, chatId, "Ссылка подключения недействительна. Попросите администратора создать новую.", null, "client_link_invalid");
+  const actualUsername = normalizeTelegramUsername(message.from?.username || "");
+  if (!actualUsername) return sendUserText(env, updateId, chatId, "В Telegram-аккаунте не найден username. Попросите администратора проверить ник в карточке клиента.", null, "client_link_username_missing");
+  const tokenHashBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token.toLowerCase())));
+  const tokenHash = Array.from(tokenHashBytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  const now = nowIso();
+  const link = await first(env.DB,
+    `SELECT t.client_id, t.expected_username FROM client_link_tokens t
+     JOIN clients c ON c.id=t.client_id
+     WHERE t.token_hash=? AND t.used_at IS NULL AND t.expires_at>? AND c.status='active' AND c.telegram_user_id IS NULL`,
+    tokenHash, now);
+  if (!link) return sendUserText(env, updateId, chatId, "Ссылка уже использована, истекла или больше не действует. Попросите администратора создать новую.", null, "client_link_expired");
+  if (actualUsername.toLowerCase() !== String(link.expected_username).toLowerCase()) {
+    return sendUserText(env, updateId, chatId, "Эта ссылка предназначена для другого Telegram-ника. Попросите администратора прислать ссылку, созданную для вашего аккаунта.", null, "client_link_username_mismatch");
+  }
+  const claimed = await run(env.DB,
+    "UPDATE client_link_tokens SET used_at=?, used_by_telegram_id=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
+    now, userId, tokenHash, now);
+  if (!claimed.meta?.changes) return sendUserText(env, updateId, chatId, "Ссылка уже использована или истекла. Попросите администратора создать новую.", null, "client_link_expired");
+  const linked = await run(env.DB,
+    "UPDATE clients SET telegram_user_id=?, telegram_username=?, updated_at=? WHERE id=? AND status='active' AND telegram_user_id IS NULL",
+    userId, actualUsername, now, link.client_id);
+  if (!linked.meta?.changes) return sendUserText(env, updateId, chatId, "Профиль уже подключён или закрыт. Напишите администратору, если доступ нужен именно вам.", null, "client_link_conflict");
+  await recordEvent(env, {
+    actorId: userId,
+    action: "client_telegram_linked",
+    entityType: "client",
+    entityId: link.client_id,
+    details: { method: "one_time_deep_link", telegramUsernameMatched: true },
+    archiveText: `Клиент подключил кабинет по одноразовой Telegram-ссылке. Профиль #${link.client_id}.`,
+    archiveKey: `archive:client-linked:${link.client_id}:${userId}`,
+  });
+  await enqueueAdmins(env, `client-linked:${link.client_id}:${userId}`, `Клиент подключил Telegram-кабинет. Профиль #${link.client_id}.`, inline([[button("Открыть карточку", `client:view:${link.client_id}`)]]), "client_linked_notice");
+  return showClientCabinet(env, updateId, chatId, userId, "Профиль подключён. Добро пожаловать!");
 }
 
 async function showClientPreviewList(env, updateId, chatId) {
@@ -1090,11 +1129,55 @@ async function showClient(env, updateId, chatId, clientId, prefix = "") {
   if (!client) return sendUserText(env, updateId, chatId, "Клиент не найден.", inline(backToAdmin()), "admin_detail");
   const services = await all(env.DB, "SELECT * FROM services WHERE client_id=? AND status='active' ORDER BY id DESC LIMIT 12", client.id);
   const rows = services.map((service) => [button(`${service.site_name} · до ${service.valid_through}`, `service:view:${service.id}`)]);
+  if (!client.telegram_user_id) rows.push([button(client.telegram_username ? "Создать ссылку для подключения" : "Добавить Telegram-ник", client.telegram_username ? `client:link:${client.id}` : `client:editfield:${client.id}:telegram_username`)]);
   rows.push([button("Добавить сайт", `service:add:${client.id}`), button("Изменить данные", `client:edit:${client.id}`)]);
   rows.push([button("Архивировать клиента", `client:archive:${client.id}`), button("Назад", "clients:1")]);
   const serviceList = services.length ? `\nСайты: ${services.length}` : "\nАктивных сайтов нет.";
   const text = `${prefix ? `${prefix}\n\n` : ""}Клиент #${client.id}: ${client.full_name}\nТелефон: ${client.phone || "не указан"}\nTelegram: ${client.telegram_username || "ник не указан"}\nE-mail: ${client.email || "не указан"}\nКабинет: ${client.telegram_user_id ? "подключён" : "не подключён"}${serviceList}`;
   return sendUserText(env, updateId, chatId, text, inline(rows), "admin_detail");
+}
+
+async function createClientLink(env, updateId, chatId, adminId, clientId) {
+  const client = await first(env.DB, "SELECT id, full_name, telegram_username, telegram_user_id, status FROM clients WHERE id=?", Number(clientId));
+  if (!client || client.status !== "active") return sendUserText(env, updateId, chatId, "Активный клиент не найден.", inline(backToAdmin()), "client_link_result");
+  if (client.telegram_user_id) return sendUserText(env, updateId, chatId, "Кабинет уже подключён. Клиент может открыть бота и отправить /start.", inline([[button("Карточка клиента", `client:view:${client.id}`)]]), "client_link_result");
+  const expectedUsername = normalizeTelegramUsername(client.telegram_username || "");
+  if (!expectedUsername) return sendUserText(env, updateId, chatId, "Сначала укажите Telegram-ник в карточке клиента.", inline([[button("Изменить ник", `client:editfield:${client.id}:telegram_username`)]]), "client_link_result");
+  let bot;
+  try {
+    bot = await telegramApi(env, "getMe", {});
+  } catch {
+    return sendUserText(env, updateId, chatId, "Не удалось получить ссылку от Telegram. Повторите попытку позже.", inline([[button("Карточка клиента", `client:view:${client.id}`)]]), "client_link_result");
+  }
+  if (!bot?.username) return sendUserText(env, updateId, chatId, "Telegram не вернул username бота; ссылку создать не удалось.", inline([[button("Карточка клиента", `client:view:${client.id}`)]]), "client_link_result");
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const token = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  const tokenHashBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
+  const tokenHash = Array.from(tokenHashBytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const duplicate = await first(env.DB, "SELECT COUNT(*) AS count FROM clients WHERE status='active' AND telegram_user_id IS NULL AND LOWER(REPLACE(telegram_username,'@',''))=LOWER(REPLACE(?,'@',''))", expectedUsername);
+  await run(env.DB, "DELETE FROM client_link_tokens WHERE expires_at<?", now);
+  await run(env.DB, "UPDATE client_link_tokens SET expires_at=? WHERE client_id=? AND used_at IS NULL", now, client.id);
+  await run(env.DB, "INSERT INTO client_link_tokens(token_hash, client_id, expected_username, created_by_telegram_id, created_at, expires_at) VALUES(?, ?, ?, ?, ?, ?)", tokenHash, client.id, expectedUsername, String(adminId), now, expiresAt);
+  await recordEvent(env, {
+    actorId: adminId,
+    action: "client_link_created",
+    entityType: "client",
+    entityId: client.id,
+    details: { method: "one_time_deep_link", usernameVerified: true, expiresAt },
+    archiveText: `Создана одноразовая ссылка подключения кабинета для профиля клиента #${client.id}. Ссылка действует 24 часа; токен в журнал не записывается.`,
+    archiveKey: `archive:client-link:${client.id}:${now}`,
+  });
+  const link = `https://t.me/${bot.username}?start=link_${token}`;
+  const warning = Number(duplicate?.count) > 1 ? "\n\nВажно: такой Telegram-ник записан у нескольких профилей. Ссылка привязывает именно выбранную карточку — отправьте её правильному клиенту." : "";
+  const text = `Одноразовая ссылка для ${client.full_name}:\n${link}\n\nОтправьте её клиенту вручную в личном чате Telegram. Бот не может первым написать по @нику. Ссылка действует 24 часа и сработает только из аккаунта ${expectedUsername}. После нажатия «Start» профиль подключится, а клиент получит приветствие и статус подписки.${warning}`;
+  try {
+    await telegramApi(env, "sendMessage", { chat_id: chatId, text, reply_markup: inline([[button("Карточка клиента", `client:view:${client.id}`)]]) });
+  } catch {
+    return sendUserText(env, updateId, chatId, "Ссылка создана, но Telegram не доставил её в чат администратора. Откройте карточку и создайте новую ссылку; предыдущая останется недействительной.", inline([[button("Карточка клиента", `client:view:${client.id}`)]]), "client_link_delivery_error");
+  }
 }
 
 async function showServices(env, updateId, chatId, page = 1) {
@@ -1729,6 +1812,7 @@ async function handleCallback(env, updateId, callback) {
     await saveSession(env.DB, userId, { flow: "new_client", step: "name", data: {} });
     return sendUserText(env, updateId, chatId, "Добавление клиента. Введите имя.", null, "admin_prompt");
   }
+  if (data.startsWith("client:link:")) return createClientLink(env, updateId, chatId, userId, Number(data.split(":")[2]));
   if (data.startsWith("client:view:")) return showClient(env, updateId, chatId, Number(data.split(":")[2]));
   if (data.startsWith("client:edit:")) return startEditClient(env, updateId, chatId, userId, Number(data.split(":")[2]));
   if (data.startsWith("client:editfield:")) {
