@@ -40,6 +40,7 @@ const ADMIN_MENU = {
       { text: "Резервная копия", callback_data: "backup" },
     ],
     [{ text: "Мои реквизиты", callback_data: "admin:requisites" }],
+    [{ text: "Предпросмотр клиента", callback_data: "admin:preview" }],
   ],
 };
 
@@ -445,6 +446,56 @@ async function showClientCabinet(env, updateId, chatId, userId) {
     [button("Запросить реквизиты для оплаты", "receipt:start")],
     [button("Обновить", "cabinet")],
   ]), "client_cabinet");
+}
+
+async function showClientPreviewList(env, updateId, chatId) {
+  const clients = await all(env.DB, "SELECT id, full_name FROM clients WHERE status='active' ORDER BY full_name COLLATE NOCASE LIMIT 20");
+  if (!clients.length) {
+    return sendUserText(env, updateId, chatId, "Пока нет активных клиентских профилей для предпросмотра. Предпросмотр ничего не отправляет клиентам и не меняет данные.", inline([[button("В меню", "menu:admin")]]), "admin_preview");
+  }
+  return sendUserText(env, updateId, chatId, "Выберите профиль, чтобы увидеть клиентское приветствие и статус подписки. Это только предпросмотр — клиенту ничего не отправится.", inline([
+    ...clients.map((client) => [button(client.full_name, `admin:preview:client:${client.id}`)]),
+    [button("В меню", "menu:admin")],
+  ]), "admin_preview_list");
+}
+
+async function showClientPreview(env, updateId, chatId, clientId) {
+  const client = await first(env.DB, "SELECT id, full_name FROM clients WHERE id=? AND status='active'", Number(clientId));
+  if (!client) return sendUserText(env, updateId, chatId, "Клиент не найден или архивирован.", inline([[button("К списку", "admin:preview"), button("В меню", "menu:admin")]]), "admin_preview");
+  const services = await all(env.DB, `SELECT s.valid_through,
+      (SELECT COUNT(*) FROM receipts r WHERE r.service_id=s.id AND r.status='pending') AS pending_receipts
+    FROM services s WHERE s.client_id=? AND s.status='active' ORDER BY s.id DESC LIMIT 12`, client.id);
+  const text = `ПРЕДПРОСМОТР · ${client.full_name}\n\n${clientWelcomeText(services)}\n\nЭто отображение для клиента. Сообщение не отправлено клиенту.`;
+  return sendUserText(env, updateId, chatId, text, inline([
+    [button("Запросить реквизиты для оплаты", `admin:preview:req:${client.id}`)],
+    [button("Обновить", `admin:preview:client:${client.id}`)],
+    [button("К списку", "admin:preview")],
+  ]), "admin_preview_client");
+}
+
+async function showPreviewRequisites(env, updateId, chatId, clientId) {
+  const services = await all(env.DB, "SELECT id, site_name, valid_through FROM services WHERE client_id=? AND status='active' ORDER BY id DESC", Number(clientId));
+  if (!services.length) return sendUserText(env, updateId, chatId, "У клиента нет активных подписок. В клиентском кабинете нечего оплачивать.", inline([[button("Назад", `admin:preview:client:${clientId}`)]]), "admin_preview_requisites");
+  if (services.length > 1) return sendUserText(env, updateId, chatId, "В клиентском кабинете клиент сначала выберет подписку:", inline([
+    ...services.map((service) => [button(`${service.site_name} · до ${service.valid_through}`, `admin:preview:reqservice:${clientId}:${service.id}`)]),
+    [button("Назад", `admin:preview:client:${clientId}`)],
+  ]), "admin_preview_requisites");
+  return showPreviewServiceRequisites(env, updateId, chatId, clientId, services[0].id);
+}
+
+async function showPreviewServiceRequisites(env, updateId, chatId, clientId, serviceId) {
+  const service = await first(env.DB, "SELECT id FROM services WHERE id=? AND client_id=? AND status='active'", Number(serviceId), Number(clientId));
+  if (!service) return sendUserText(env, updateId, chatId, "Активная подписка не найдена.", inline([[button("Назад", `admin:preview:client:${clientId}`)]]), "admin_preview_requisites");
+  const requisites = await getSetting(env.DB, "payment_requisites");
+  if (!requisites) return sendUserText(env, updateId, chatId, "Реквизиты пока не настроены. Клиент увидит эту подсказку вместо платёжных данных.", inline([[button("Назад", `admin:preview:client:${clientId}`)]]), "admin_preview_requisites");
+  return sendUserText(env, updateId, chatId, `ПРЕДПРОСМОТР · реквизиты для оплаты\n\n${requisites}\n\nПосле оплаты клиент прикладывает подтверждение. Реальной отправки клиенту нет.`, inline([
+    [button("Предоставить изображение или файл", "admin:preview:upload")],
+    [button("Назад", `admin:preview:client:${clientId}`)],
+  ]), "admin_preview_requisites");
+}
+
+async function showPreviewUpload(env, updateId, chatId) {
+  return sendUserText(env, updateId, chatId, "В настоящем клиентском чате после этой кнопки бот принимает только фотографию, изображение или PDF. В режиме предпросмотра загрузка отключена — файл не отправлен и оплата не зарегистрирована.", inline([[button("К экрану клиента", "admin:preview")], [button("В меню", "menu:admin")]]), "admin_preview_upload");
 }
 
 async function askPhone(env, updateId, chatId) {
@@ -1638,6 +1689,14 @@ async function handleCallback(env, updateId, callback) {
   if (data === "receipt:upload") return startReceiptUpload(env, updateId, chatId, userId);
   if (data === "cabinet") return showClientCabinet(env, updateId, chatId, userId);
   if (/^receipt:service:\d+$/.test(data)) return startReceiptForService(env, updateId, chatId, userId, Number(data.split(":")[2]));
+  if (data === "admin:preview") return showClientPreviewList(env, updateId, chatId);
+  if (/^admin:preview:client:\d+$/.test(data)) return showClientPreview(env, updateId, chatId, Number(data.split(":")[3]));
+  if (/^admin:preview:req:\d+$/.test(data)) return showPreviewRequisites(env, updateId, chatId, Number(data.split(":")[3]));
+  if (/^admin:preview:reqservice:\d+:\d+$/.test(data)) {
+    const [, , , clientId, serviceId] = data.split(":");
+    return showPreviewServiceRequisites(env, updateId, chatId, Number(clientId), Number(serviceId));
+  }
+  if (data === "admin:preview:upload") return showPreviewUpload(env, updateId, chatId);
   if (data === "admin:requisites") return showPaymentRequisites(env, updateId, chatId);
   if (data === "admin:requisites:edit") {
     await saveSession(env.DB, userId, { flow: "payment_requisites", step: "value", data: {} });
